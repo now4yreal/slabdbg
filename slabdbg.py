@@ -21,6 +21,17 @@ FLAGS = {
         0x80000000: "__OBJECT_POISON",
         }
 
+def swab(x):
+    return int(
+        ((x & 0x00000000000000FF) << 56)
+        | ((x & 0x000000000000FF00) << 40)
+        | ((x & 0x0000000000FF0000) << 24)
+        | ((x & 0x00000000FF000000) << 8)
+        | ((x & 0x000000FF00000000) >> 8)
+        | ((x & 0x0000FF0000000000) >> 24)
+        | ((x & 0x00FF000000000000) >> 40)
+        | ((x & 0xFF00000000000000) >> 56)
+    )
 
 class KmemCacheAllocFinish(gdb.FinishBreakpoint):
     def __init__(self, command, name):
@@ -103,7 +114,7 @@ class DiscardSlab(gdb.Breakpoint):
     def stop(self):
         slab_cache = gdb.selected_frame().read_var("s")
         name = slab_cache["name"].string()
-        page = gdb.selected_frame().read_var("page")
+        page = gdb.selected_frame().read_var("slab")
         addr = int(page) & Slab.UNSIGNED_LONG
         return self.command.notify_discard(name, addr)
 
@@ -251,6 +262,17 @@ class Slab(gdb.Command):
             pos = pos["next"].dereference()
 
     @staticmethod
+    def for_each_entry_p(type1, type2, head, member):
+        void_p = gdb.lookup_type("void").pointer()
+        offset = Slab.get_field_bitpos(type1, member) // 8
+
+        pos = head["next"].dereference()
+        while pos.address != head.address:
+            entry = gdb.Value(pos.address.cast(void_p) - offset)
+            yield entry.cast(type2.pointer()).dereference()
+            pos = pos["next"].dereference()
+
+    @staticmethod
     def iter_slab_caches():
         kmem_cache = gdb.lookup_type("struct kmem_cache")
         slab_caches = gdb.lookup_global_symbol("slab_caches").value()
@@ -295,7 +317,7 @@ class Slab(gdb.Command):
     def page_addr(self, page):
         if 'x86-64' in self.arch:
             offset = (page-0xffffea0000000000) >> 6 << 0xc
-            return 0xFFFF880000000000 + offset # this value depends on kernel version if could be 0xFFFF888000000000
+            return 0xFFFF888000000000 + offset # this value depends on kernel version if could be 0xFFFF888000000000
         else:
             memstart_addr = int(self.memstart_addr) & Slab.UNSIGNED_LONG
             addr = (memstart_addr >> 6) & Slab.UNSIGNED_LONG
@@ -310,12 +332,24 @@ class Slab(gdb.Command):
     def walk_freelist(slab_cache, freelist):
         void = gdb.lookup_type("void").pointer().pointer()
         offset = int(slab_cache["offset"])
+        try:
+            random = int(slab_cache["random"])
+        except:
+            pass
         while freelist:
             address = int(freelist) & Slab.UNSIGNED_LONG
             yield address
-            freelist = gdb.Value(address + offset).cast(void).dereference()
+            freelist = int(gdb.Value(address + offset).cast(void).dereference())
+            try:
+                freelist ^= random ^ swab(address+offset)
+            except:
+                pass
 
     def format_slab(self, slab, indent, freelist=None):
+        slab_cache = slab["slab_cache"]
+        size = int(slab_cache["size"])
+        freelist = list(Slab.walk_freelist(slab_cache, freelist))
+        
         address = int(slab.address) & Slab.UNSIGNED_LONG
         s = "Slab @ 0x%x:" % address + "\n"
         objects = int(slab["objects"]) & Slab.UNSIGNED_INT
@@ -324,16 +358,21 @@ class Slab(gdb.Command):
         s += " " * (indent + 4) + ("In-Use: %d\n" % inuse)
         frozen = int(slab["frozen"])
         s += " " * (indent + 4) + ("Frozen: %d\n" % frozen)
-        fp = int(slab["freelist"]) & Slab.UNSIGNED_LONG
-        s += " " * (indent + 4) + ("Freelist: 0x%x\n" % fp)
+        
+        s += " " * (indent + 4)
+        if len(freelist) != 0:
+            s += ("Freelist: ")
+            for i in range(len(freelist)):
+                if i == len(freelist) - 1:
+                    s += "0x%x\n" % freelist[i]
+                else:
+                    s += "0x%x -> " % freelist[i]
+        else:
+            s += ("Freelist: \n")
 
         page_addr = self.page_addr(address)
         s += " " * (indent + 4) + ("Page @ 0x%x:\n" % page_addr)
-        slab_cache = slab["slab_cache"]
-        size = int(slab_cache["size"])
-        if freelist is None:
-            freelist = slab["freelist"]
-        freelist = list(Slab.walk_freelist(slab_cache, freelist))
+        
         for address in range(page_addr, page_addr + objects * size, size):
             if address in freelist:
                 s += " " * (indent + 8) + (" - Object (free) @ 0x%x\n" % address)
@@ -376,6 +415,9 @@ class Slab(gdb.Command):
             elif args[0] == "print" and len(args) == 2:
                 self.invoke_print(args[1])
                 return
+            elif args[0] == "trace-off" :
+                self.invoke_trace_off()
+                return
         self.invoke_help()
 
     def complete(self, text, word):
@@ -404,6 +446,7 @@ class Slab(gdb.Command):
         print("  slab break <name> - Start/stop breaking on allocation for a slab cache")
         print("  slab watch <name> - Start/stop watching full-slabs for a slab cache")
         print("  slab print <slab> - Print the objects contained in a slab")
+        print("  slab trace-off <slab> - Disable trace")
 
     def invoke_list(self):
         print("name                    objs inuse slabs size obj_size objs_per_slab pages_per_slab")
@@ -414,8 +457,8 @@ class Slab(gdb.Command):
             objs, inuse, slabs = 0, 0, 0
 
             cpu_cache = self.get_current_slab_cache_cpu(slab_cache)
-            if cpu_cache["page"]:
-                objs = inuse = int(cpu_cache["page"]["objects"]) & Slab.UNSIGNED_INT
+            if cpu_cache["slab"]:
+                objs = inuse = int(cpu_cache["slab"]["objects"]) & Slab.UNSIGNED_INT
                 if cpu_cache["freelist"]:
                     inuse -= len(list(Slab.walk_freelist(slab_cache, cpu_cache["freelist"])))
                 slabs += 1
@@ -474,9 +517,15 @@ class Slab(gdb.Command):
             print("    Per-CPU Data (cpu %d) @ 0x%x" % (cpu_id, address))
             freelist = int(cpu_cache["freelist"]) & Slab.UNSIGNED_LONG
             print("        Freelist: 0x%x" % freelist)
-            if cpu_cache["page"]:
-                slab = cpu_cache["page"].dereference()
-                print("        Page: " + self.format_slab(slab, 8, cpu_cache["freelist"]))
+            if cpu_cache["slab"]:
+                slab_ptr = cpu_cache["slab"]
+                while slab_ptr:
+                    try:
+                        slab = slab_ptr.dereference()
+                        print("        Page: " + self.format_slab(slab, 8, cpu_cache["freelist"]))
+                        slab_ptr = slab["next"]
+                    except:
+                        break
             else:
                 print("        Page: (none)")
             if cpu_cache["partial"]:
@@ -494,19 +543,20 @@ class Slab(gdb.Command):
             node_cache = slab_cache["node"][node_id]
             address = int(node_cache.address) & Slab.UNSIGNED_LONG
             print("    Per-Node Data (node %d) @ 0x%x:" % (node_id, address))
-            page = gdb.lookup_type("struct page")
-            partials = list(Slab.for_each_entry(page, node_cache["partial"], "lru"))
+            page1 = gdb.lookup_type("struct page")
+            page2 = gdb.lookup_type("struct slab")
+            partials = list(Slab.for_each_entry_p(page1, page2, node_cache["partial"], "lru"))
             if partials:
                 print("        Partial List:")
                 for slab in partials:
-                    print("            - " + self.format_slab(slab, 14))
+                    print("            - " + self.format_slab(slab, 14, slab["freelist"]))
             else:
                 print("        Partial List: (none)")
             fulls = list(self.get_full_slabs(slab_cache))
             if fulls:
                 print("        Full List:")
                 for slab in fulls:
-                    print("            - " + self.format_slab(slab, 14))
+                    print("            - " + self.format_slab(slab, 14, slab["freelist"]))
             else:
                 print("        Full List: (none)")
 
@@ -524,6 +574,11 @@ class Slab(gdb.Command):
                 print("Started tracing slab cache '%s'" % name)
                 self.trace_caches.append(name)
             self.update_breakpoints()
+
+    def invoke_trace_off(self):
+        self.trace_caches = []
+        self.update_breakpoints()
+        
 
     def invoke_break(self, names):
         for name in names:
