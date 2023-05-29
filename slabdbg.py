@@ -519,13 +519,15 @@ class Slab(gdb.Command):
             print("        Freelist: 0x%x" % freelist)
             if cpu_cache["slab"]:
                 slab_ptr = cpu_cache["slab"]
-                while slab_ptr:
-                    try:
-                        slab = slab_ptr.dereference()
-                        print("        Page: " + self.format_slab(slab, 8, cpu_cache["freelist"]))
-                        slab_ptr = slab["next"]
-                    except:
-                        break
+                slab = slab_ptr.dereference()
+                print("        Page: " + self.format_slab(slab, 8, cpu_cache["freelist"]))
+                # while slab_ptr:
+                #     try:
+                #         slab = slab_ptr.dereference()
+                #         print("        Page: " + self.format_slab(slab, 8, cpu_cache["freelist"]))
+                #         slab_ptr = slab["next"]
+                #     except:
+                #         break
             else:
                 print("        Page: (none)")
             if cpu_cache["partial"]:
